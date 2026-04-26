@@ -5,26 +5,40 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-// 错误码枚举
 typedef enum {
-    VR_SUCCESS = 0,      // 成功
-    VR_ERROR_INIT,       // 初始化错误
-    VR_ERROR_API         // API调用错误
+    VR_SUCCESS = 0,
+    VR_ERROR_INIT,
+    VR_ERROR_FILE
 } vr_error_t;
 
-// 初始化语音识别模块
+/**
+ * @brief 初始化 I2S 麦克风驱动（16kHz, 16bit, 单声道）
+ * @return VR_SUCCESS 或 VR_ERROR_INIT
+ */
 vr_error_t vr_init(void);
 
-// 开始录音
+/**
+ * @brief 开始录音（清空内部缓冲区）
+ * @return VR_SUCCESS 或 VR_ERROR_INIT
+ */
 vr_error_t vr_start_recording(void);
 
-// 停止录音并进行识别
-vr_error_t vr_stop_and_recognize(char **result);
+/**
+ * @brief 停止录音并将缓冲区数据保存为 WAV 文件
+ * @param filename FatFS 文件路径（如 "/sdcard/rec.wav"）
+ * @return VR_SUCCESS 或 VR_ERROR_FILE
+ */
+vr_error_t vr_stop_and_save(const char *filename);
 
-// 反初始化，释放资源
+/**
+ * @brief 释放资源，卸载 I2S 驱动
+ */
 void vr_deinit(void);
 
-// 处理音频数据（内部使用）
-vr_error_t vr_process_audio(uint8_t *audio_data, size_t data_len, char **result);
+/**
+ * @brief 录音任务函数（需在 FreeRTOS 中创建）
+ * @param pvParameters 未使用
+ */
+void vr_recording_task(void *pvParameters);
 
-#endif // _VOICE_RECOGNITION_H_
+#endif

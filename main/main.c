@@ -4,6 +4,7 @@
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 
+
 static const char *TAG = "INMP441";
 
 // 根据实际接线修改 GPIO 编号
@@ -67,3 +68,5 @@ void app_main(void)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
+
+

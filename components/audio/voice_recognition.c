@@ -1,250 +1,171 @@
 #include "voice_recognition.h"
-#include "driver/i2s.h"
-#include "esp_http_client.h"
-#include "cJSON.h"
-#include "esp_base64.h"
+#include "driver/i2s_std.h"
+#include "wav_encoder.h"
+#include "ff.h"
+#include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
 
-#define AUDIO_BUFFER_SIZE 4096
+#define AUDIO_BUFFER_SIZE   (16000 * 2 * 3)   // 3秒音频：16000采样/秒 * 2字节/采样 * 3秒 = 96000字节
+#define I2S_PORT            I2S_NUM_0
+
+static const char *TAG = "VR";
 
 static uint8_t *audio_buffer = NULL;
 static size_t audio_buffer_size = 0;
 static bool is_recording = false;
-
-// Base64编码函数
-static char *base64_encode(const uint8_t *data, size_t data_len)
-{
-    size_t encoded_size = esp_base64_encode_len(data_len);
-    char *encoded = (char *)malloc(encoded_size + 1);
-    if (!encoded) {
-        return NULL;
-    }
-    
-    esp_base64_encode(encoded, data, data_len);
-    encoded[encoded_size] = '\0';
-    return encoded;
-}
-
-// 调用硅基流动API进行语音识别
-vr_error_t vr_process_audio(uint8_t *audio_data, size_t data_len, char **result)
-{
-    // 硅基流动API的URL
-    const char *url = "https://api.siliconflow.cn/v1/speech-to-text";
-    
-    // API密钥，实际项目中应该从配置文件或安全存储中获取
-    const char *api_key = "YOUR_API_KEY";
-    
-    // 创建HTTP客户端配置
-    esp_http_client_config_t config = {
-        .url = url,
-        .method = HTTP_METHOD_POST,
-    };
-    
-    // 创建HTTP客户端
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        return VR_ERROR_API;
-    }
-    
-    // 设置请求头
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Authorization", api_key);
-    
-    // 构建请求体
-    cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "model", "whisper-large-v3");
-    cJSON_AddStringToObject(root, "language", "zh");
-    
-    // 将音频数据转换为Base64编码
-    char *base64_audio = base64_encode(audio_data, data_len);
-    if (!base64_audio) {
-        cJSON_Delete(root);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    cJSON_AddStringToObject(root, "audio", base64_audio);
-    
-    char *request_body = cJSON_Print(root);
-    cJSON_Delete(root);
-    free(base64_audio);
-    
-    if (!request_body) {
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    // 设置请求体
-    esp_http_client_set_post_field(client, request_body, strlen(request_body));
-    
-    // 发送请求
-    esp_err_t ret = esp_http_client_perform(client);
-    if (ret != ESP_OK) {
-        free(request_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    // 获取响应状态码
-    int status_code = esp_http_client_get_status_code(client);
-    if (status_code != 200) {
-        free(request_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    // 读取响应体
-    size_t content_length = esp_http_client_get_content_length(client);
-    char *response_body = (char *)malloc(content_length + 1);
-    if (!response_body) {
-        free(request_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    ret = esp_http_client_read(client, response_body, content_length);
-    if (ret != content_length) {
-        free(request_body);
-        free(response_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    response_body[content_length] = '\0';
-    
-    // 解析响应体
-    root = cJSON_Parse(response_body);
-    if (!root) {
-        free(request_body);
-        free(response_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    cJSON *text = cJSON_GetObjectItem(root, "text");
-    if (!text || !cJSON_IsString(text)) {
-        cJSON_Delete(root);
-        free(request_body);
-        free(response_body);
-        esp_http_client_cleanup(client);
-        return VR_ERROR_API;
-    }
-    
-    // 提取识别结果
-    *result = strdup(text->valuestring);
-    
-    // 清理资源
-    cJSON_Delete(root);
-    free(request_body);
-    free(response_body);
-    esp_http_client_cleanup(client);
-    
-    return VR_SUCCESS;
-}
+static i2s_chan_handle_t rx_handle = NULL;   // I2S 接收通道句柄
 
 vr_error_t vr_init(void)
 {
-    // I2S配置
-    i2s_config_t i2s_config = {
-        .mode = I2S_MODE_MASTER | I2S_MODE_RX,
-        .sample_rate = 16000,
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-        .dma_buf_count = 8,
-        .dma_buf_len = 64,
-        .use_apll = false,
-        .tx_desc_auto_clear = false,
-        .fixed_mclk = 0
-    };
-
-    // I2S引脚配置
-    i2s_pin_config_t pin_config = {
-        .bck_io_num = 26,
-        .ws_io_num = 25,
-        .data_out_num = I2S_PIN_NO_CHANGE,
-        .data_in_num = 33
-    };
-
-    // 初始化I2S驱动
-    esp_err_t ret = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
-    if (ret != ESP_OK) {
-        return VR_ERROR_INIT;
-    }
-
-    ret = i2s_set_pin(I2S_NUM_0, &pin_config);
-    if (ret != ESP_OK) {
-        i2s_driver_uninstall(I2S_NUM_0);
-        return VR_ERROR_INIT;
-    }
-
-    // 分配音频缓冲区
+    // 1. 分配音频缓冲区
     audio_buffer = (uint8_t *)malloc(AUDIO_BUFFER_SIZE);
     if (!audio_buffer) {
-        i2s_driver_uninstall(I2S_NUM_0);
+        ESP_LOGE(TAG, "Failed to allocate audio buffer");
+        return VR_ERROR_INIT;
+    }
+    audio_buffer_size = 0;
+
+    // 2. 配置 I2S 通道（仅接收，主模式）
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_PORT, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 8;          // DMA 描述符数量
+    chan_cfg.dma_frame_num = 64;        // 每帧样本数（决定中断频率）
+    esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create I2S channel");
+        free(audio_buffer);
+        audio_buffer = NULL;
         return VR_ERROR_INIT;
     }
 
-    audio_buffer_size = 0;
+    // 3. 配置标准 I2S 模式参数（16kHz, 16bit, 单声道）
+    i2s_std_config_t std_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(16000),          // 采样率 16000 Hz
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,    // 无需 MCLK
+            .bclk = 26,                 // BCK 引脚
+            .ws   = 25,                 // WS 引脚
+            .dout = I2S_GPIO_UNUSED,    // 仅接收，不发送
+            .din  = 33,                 // DATA_IN 引脚
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv   = false,
+            },
+        },
+    };
+    ret = i2s_channel_init_std_mode(rx_handle, &std_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize I2S standard mode");
+        i2s_del_channel(rx_handle);
+        free(audio_buffer);
+        audio_buffer = NULL;
+        return VR_ERROR_INIT;
+    }
+
+    // 4. 启用 I2S 通道
+    ret = i2s_channel_enable(rx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to enable I2S channel");
+        i2s_del_channel(rx_handle);
+        free(audio_buffer);
+        audio_buffer = NULL;
+        return VR_ERROR_INIT;
+    }
+
+    ESP_LOGI(TAG, "I2S initialized successfully");
     return VR_SUCCESS;
 }
 
 vr_error_t vr_start_recording(void)
 {
     if (!audio_buffer) {
+        ESP_LOGE(TAG, "Module not initialized");
         return VR_ERROR_INIT;
     }
-
     is_recording = true;
     audio_buffer_size = 0;
+    ESP_LOGI(TAG, "Recording started");
     return VR_SUCCESS;
 }
 
-vr_error_t vr_stop_and_recognize(char **result)
+vr_error_t vr_stop_and_save(const char *filename)
 {
     if (!audio_buffer) {
         return VR_ERROR_INIT;
     }
 
     is_recording = false;
-    
-    // 调用硅基流动API进行语音识别
-    return vr_process_audio(audio_buffer, audio_buffer_size, result);
-}
 
-// 录音任务
-void vr_recording_task(void *pvParameters)
-{
-    size_t bytes_read = 0;
-
-    while (1) {
-        if (is_recording && audio_buffer_size < AUDIO_BUFFER_SIZE) {
-            // 读取麦克风数据
-            esp_err_t ret = i2s_read(
-                I2S_NUM_0,
-                audio_buffer + audio_buffer_size,
-                AUDIO_BUFFER_SIZE - audio_buffer_size,
-                &bytes_read,
-                pdMS_TO_TICKS(10)
-            );
-
-            if (ret == ESP_OK) {
-                audio_buffer_size += bytes_read;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(10));
+    if (audio_buffer_size == 0) {
+        ESP_LOGW(TAG, "No audio data recorded");
+        return VR_ERROR_FILE;
     }
+
+    // 打开文件
+    FIL file;
+    FRESULT fr = f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        ESP_LOGE(TAG, "Failed to open file '%s', error: %d", filename, fr);
+        return VR_ERROR_FILE;
+    }
+
+    // 写入 WAV 头（占位）
+    wav_encoder_write_header(&file);
+
+    // 写入 PCM 数据
+    int sample_count = audio_buffer_size / sizeof(int16_t);
+    wav_encoder_encode_data(&file, (const int16_t*)audio_buffer, sample_count);
+
+    // 回填头部长度字段
+    wav_encoder_fix_header(&file, sample_count);
+
+    f_close(&file);
+    ESP_LOGI(TAG, "Audio saved to '%s', %d bytes", filename, audio_buffer_size);
+    return VR_SUCCESS;
 }
 
 void vr_deinit(void)
 {
-    // 释放音频缓冲区
+    if (rx_handle) {
+        i2s_channel_disable(rx_handle);
+        i2s_del_channel(rx_handle);
+        rx_handle = NULL;
+    }
     if (audio_buffer) {
         free(audio_buffer);
         audio_buffer = NULL;
     }
+    audio_buffer_size = 0;
+    is_recording = false;
+    ESP_LOGI(TAG, "Module deinitialized");
+}
 
-    // 释放I2S资源
-    i2s_driver_uninstall(I2S_NUM_0);
+// 录音任务（需在 app_main 中创建）
+void vr_recording_task(void *pvParameters)
+{
+    size_t bytes_read = 0;
+    uint8_t *buffer_ptr = NULL;
+    size_t remaining = 0;
+    esp_err_t ret;
+
+    while (1) {
+        if (is_recording && audio_buffer_size < AUDIO_BUFFER_SIZE) {
+            buffer_ptr = audio_buffer + audio_buffer_size;
+            remaining = AUDIO_BUFFER_SIZE - audio_buffer_size;
+
+            ret = i2s_channel_read(rx_handle, buffer_ptr, remaining, &bytes_read, pdMS_TO_TICKS(10));
+            if (ret == ESP_OK && bytes_read > 0) {
+                audio_buffer_size += bytes_read;
+                if (audio_buffer_size >= AUDIO_BUFFER_SIZE) {
+                    ESP_LOGW(TAG, "Audio buffer full, stopping recording automatically");
+                    is_recording = false;   // 缓冲区满后自动停止
+                }
+            } else if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(ret));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
 }
