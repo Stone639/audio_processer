@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+
 /**
  * @brief 写入 WAV 文件头（44 字节，占位）
  * @param file  FatFS 文件对象指针（已打开可写）
@@ -28,6 +29,11 @@ void wav_encoder_encode_data(FIL *file, const int16_t *pcm_buf, int sample_count
  * @param sample_count 总采样点数
  */
 void wav_encoder_fix_header(FIL *file, int sample_count);
+
+
+// 新增：PCM原始文件的句柄和函数声明
+void pcm_raw_file_open(FIL *pcm_file, const char *path);
+void pcm_raw_file_write(FIL *pcm_file, const int16_t *pcm_buf, int sample_count);
 
 #ifdef __cplusplus
 }

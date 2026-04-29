@@ -6,4 +6,5 @@ idf_component_register(
         esp_driver_i2s 
         audio
         json
+        storage
 )

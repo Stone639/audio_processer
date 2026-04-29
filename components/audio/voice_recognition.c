@@ -44,10 +44,10 @@ vr_error_t vr_init(void)
         .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
             .mclk = I2S_GPIO_UNUSED,    // 无需 MCLK
-            .bclk = 26,                 // BCK 引脚
-            .ws   = 25,                 // WS 引脚
+            .bclk = 47,                 // BCK 引脚
+            .ws   = 10,                 // WS 引脚
             .dout = I2S_GPIO_UNUSED,    // 仅接收，不发送
-            .din  = 33,                 // DATA_IN 引脚
+            .din  = 21,                 // DATA_IN 引脚
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
