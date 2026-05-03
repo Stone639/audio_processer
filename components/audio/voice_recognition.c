@@ -1,12 +1,15 @@
 #include "voice_recognition.h"
 #include "driver/i2s_std.h"
 #include "wav_encoder.h"
-#include "ff.h"
+#include "littlefs_manager.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define AUDIO_BUFFER_SIZE   (16000 * 2 * 3)   // 3秒音频：16000采样/秒 * 2字节/采样 * 3秒 = 96000字节
+#define AUDIO_BUFFER_SIZE   (AUDIO_SAMPLE_RATE * (AUDIO_BIT_DEPTH / 8) * AUDIO_CHANNELS * (RECORD_DURATION_MS / 1000))
 #define I2S_PORT            I2S_NUM_0
 
 static const char *TAG = "VR";
@@ -38,16 +41,16 @@ vr_error_t vr_init(void)
         return VR_ERROR_INIT;
     }
 
-    // 3. 配置标准 I2S 模式参数（16kHz, 16bit, 单声道）
+    // 3. 配置标准 I2S 模式参数（32位宽，适配 INMP441 的 24bit/32bit 帧格式）
     i2s_std_config_t std_cfg = {
-        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(16000),          // 采样率 16000 Hz
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,    // 无需 MCLK
-            .bclk = 47,                 // BCK 引脚
-            .ws   = 10,                 // WS 引脚
-            .dout = I2S_GPIO_UNUSED,    // 仅接收，不发送
-            .din  = 21,                 // DATA_IN 引脚
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = I2S_PIN_BCK,
+            .ws   = I2S_PIN_WS,
+            .dout = I2S_GPIO_UNUSED,
+            .din  = I2S_PIN_DIN,
             .invert_flags = {
                 .mclk_inv = false,
                 .bclk_inv = false,
@@ -90,39 +93,35 @@ vr_error_t vr_start_recording(void)
     return VR_SUCCESS;
 }
 
-vr_error_t vr_stop_and_save(const char *filename)
+vr_error_t vr_stop_and_save_to_littlefs(void)
 {
-    if (!audio_buffer) {
-        return VR_ERROR_INIT;
-    }
-
+    if (!audio_buffer) return VR_ERROR_INIT;
     is_recording = false;
+    if (audio_buffer_size == 0) return VR_ERROR_FILE;
 
-    if (audio_buffer_size == 0) {
-        ESP_LOGW(TAG, "No audio data recorded");
+    // 1. 生成LittleFS下的文件名
+    char filepath[64];
+    littlefs_get_next_filename(filepath, sizeof(filepath));
+
+    // 2. 打开文件（LittleFS路径）
+    FILE *f = fopen(filepath, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open file for writing: %s", filepath);
         return VR_ERROR_FILE;
     }
 
-    // 打开文件
-    FIL file;
-    FRESULT fr = f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
-    if (fr != FR_OK) {
-        ESP_LOGE(TAG, "Failed to open file '%s', error: %d", filename, fr);
-        return VR_ERROR_FILE;
-    }
-
-    // 写入 WAV 头（占位）
-    wav_encoder_write_header(&file);
-
-    // 写入 PCM 数据
+    // 3. 写入WAV（复用你原来的wav_encoder逻辑）
+    wav_encoder_write_header(f);
     int sample_count = audio_buffer_size / sizeof(int16_t);
-    wav_encoder_encode_data(&file, (const int16_t*)audio_buffer, sample_count);
+    wav_encoder_encode_data(f, (const int16_t*)audio_buffer, sample_count);
+    wav_encoder_fix_header(f, sample_count);
 
-    // 回填头部长度字段
-    wav_encoder_fix_header(&file, sample_count);
+    fclose(f);
+    ESP_LOGI(TAG, "WAV saved locally: %s", filepath);
 
-    f_close(&file);
-    ESP_LOGI(TAG, "Audio saved to '%s', %d bytes", filename, audio_buffer_size);
+    // 4. 检查并清理旧文件（防止存满）
+    littlefs_cleanup_old_files();
+
     return VR_SUCCESS;
 }
 
@@ -143,27 +142,42 @@ void vr_deinit(void)
 }
 
 // 录音任务（需在 app_main 中创建）
+// I2S 以 32 位读取（适配 INMP441），转换为 16 位存入 audio_buffer
 void vr_recording_task(void *pvParameters)
 {
+    int32_t i2s_raw[256];   // I2S 读取缓冲区（32位样本）
     size_t bytes_read = 0;
-    uint8_t *buffer_ptr = NULL;
-    size_t remaining = 0;
     esp_err_t ret;
+    int timeout_count = 0;
 
     while (1) {
         if (is_recording && audio_buffer_size < AUDIO_BUFFER_SIZE) {
-            buffer_ptr = audio_buffer + audio_buffer_size;
-            remaining = AUDIO_BUFFER_SIZE - audio_buffer_size;
+            // 计算本次最多读多少32位样本（留够16位存储空间）
+            size_t max_raw = (AUDIO_BUFFER_SIZE - audio_buffer_size) / sizeof(int16_t);
+            size_t read_bytes = max_raw * sizeof(int32_t);
+            if (read_bytes > sizeof(i2s_raw)) read_bytes = sizeof(i2s_raw);
 
-            ret = i2s_channel_read(rx_handle, buffer_ptr, remaining, &bytes_read, pdMS_TO_TICKS(10));
+            ret = i2s_channel_read(rx_handle, i2s_raw, read_bytes, &bytes_read, pdMS_TO_TICKS(10));
             if (ret == ESP_OK && bytes_read > 0) {
-                audio_buffer_size += bytes_read;
+                timeout_count = 0;
+                // 32位转16位：取高16位（INMP441 有效数据在高位）
+                int samples_read = bytes_read / sizeof(int32_t);
+                int16_t *out = (int16_t *)(audio_buffer + audio_buffer_size);
+                for (int i = 0; i < samples_read; i++) {
+                    out[i] = (int16_t)(i2s_raw[i] >> 16);
+                }
+                audio_buffer_size += samples_read * sizeof(int16_t);
                 if (audio_buffer_size >= AUDIO_BUFFER_SIZE) {
-                    ESP_LOGW(TAG, "Audio buffer full, stopping recording automatically");
-                    is_recording = false;   // 缓冲区满后自动停止
+                    ESP_LOGI(TAG, "Audio buffer full (%d bytes), stopping recording", audio_buffer_size);
+                    is_recording = false;
                 }
             } else if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(ret));
+                timeout_count++;
+                if (timeout_count <= 3) {
+                    ESP_LOGW(TAG, "I2S read error: %s", esp_err_to_name(ret));
+                } else if (timeout_count == 4) {
+                    ESP_LOGW(TAG, "I2S read keeps failing, suppressing further logs. Check microphone wiring.");
+                }
             }
         }
         vTaskDelay(pdMS_TO_TICKS(10));

@@ -24,11 +24,10 @@ vr_error_t vr_init(void);
 vr_error_t vr_start_recording(void);
 
 /**
- * @brief 停止录音并将缓冲区数据保存为 WAV 文件
- * @param filename FatFS 文件路径（如 "/sdcard/rec.wav"）
+ * @brief 停止录音并将缓冲区数据保存为 WAV 文件到 LittleFS
  * @return VR_SUCCESS 或 VR_ERROR_FILE
  */
-vr_error_t vr_stop_and_save(const char *filename);
+vr_error_t vr_stop_and_save_to_littlefs(void);
 
 /**
  * @brief 释放资源，卸载 I2S 驱动

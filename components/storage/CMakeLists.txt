@@ -1,9 +1,12 @@
 idf_component_register(
-    SRCS  "sdcard.c" 
+    SRCS  
+        "littlefs_manager.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
-        fatfs
-        esp_driver_sdmmc
-        esp_driver_sdspi
+        littlefs
+        esp_timer
+        esp_http_client
+        vfs
+        config
 )

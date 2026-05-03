@@ -1,6 +1,8 @@
 #include "wav_encoder.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "WAV_ENCODER";
 
@@ -20,97 +22,113 @@ typedef struct {
     uint32_t data_size;
 } __attribute__((packed)) wav_header_t;
 
-
-// 打开原始PCM文件（无任何头信息，纯数据）
-/**
- * @brief 打开 PCM 原始音频文件用于写入
- * @param pcm_file 指向 FIL 结构体的指针，用于存储文件句柄
- * @param path 文件路径字符串
- * @note 如果文件已存在，将被覆盖（FA_CREATE_ALWAYS）
- * @note 不进行任何音频格式转换，直接写入原始 PCM 数据
- */
-void pcm_raw_file_open(FIL *pcm_file, const char *path)
+// 打开原始PCM文件（LittleFS 路径，如 "/rec_raw.pcm"）
+void pcm_raw_file_open(FILE *pcm_file, const char *path)
 {
-    FRESULT res = f_open(pcm_file, path, FA_WRITE | FA_CREATE_ALWAYS);
-    if (res != FR_OK) {
-        ESP_LOGE(TAG, "Failed to open PCM raw file: %d", res);
-    } else {
-        ESP_LOGI(TAG, "PCM raw file opened successfully: %s", path);
+    // 以二进制写模式打开，覆盖已有文件（LittleFS 兼容）
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open PCM raw file: %s", path);
+        *pcm_file = *f; // 传递空指针
+        return;
     }
+    *pcm_file = *f;
+    ESP_LOGI(TAG, "PCM raw file opened successfully: %s", path);
 }
 
-// 写入PCM原始数据到文件
-/**
- * @brief 将 PCM 原始数据写入文件
- * 
- * @param pcm_file 指向已打开的文件对象指针
- * @param pcm_buf PCM 数据缓冲区，每个样本为 16 位有符号整数
- * @param sample_count 要写入的 PCM 样本数量
- * 
- * @note 函数会校验参数有效性，无效时直接返回
- * @note 写入失败时会记录错误日志
- * @note 写入成功时在调试日志中记录写入字节数
- */
-void pcm_raw_file_write(FIL *pcm_file, const int16_t *pcm_buf, int sample_count)
+// 写入PCM原始数据到LittleFS文件
+void pcm_raw_file_write(FILE *pcm_file, const int16_t *pcm_buf, int sample_count)
 {
     if (pcm_file == NULL || pcm_buf == NULL || sample_count <= 0) {
         return;
     }
 
-    UINT bytes_written = 0;
     size_t bytes_to_write = sample_count * sizeof(int16_t);
+    size_t bytes_written = fwrite(pcm_buf, 1, bytes_to_write, pcm_file);
 
-    FRESULT res = f_write(pcm_file, pcm_buf, bytes_to_write, &bytes_written);
-    if (res != FR_OK || bytes_written != bytes_to_write) {
-        ESP_LOGE(TAG, "Failed to write PCM raw data: res=%d, written=%u/%zu",
-                 res, bytes_written, bytes_to_write);
+    if (bytes_written != bytes_to_write) {
+        ESP_LOGE(TAG, "Failed to write PCM raw data: written=%zu/%zu",
+                 bytes_written, bytes_to_write);
     } else {
-        ESP_LOGD(TAG, "PCM raw data written: %u bytes", bytes_written);
+        ESP_LOGD(TAG, "PCM raw data written: %zu bytes", bytes_written);
     }
 }
 
-
-
-
-void wav_encoder_write_header(FIL *file)
+// 写入WAV头（适配 FILE*）
+void wav_encoder_write_header(FILE *file)
 {
+    if (!file) {
+        ESP_LOGE(TAG, "Invalid FILE pointer for WAV header");
+        return;
+    }
+
     wav_header_t header;
-    UINT bytes_written;
+    memset(&header, 0, sizeof(header));
 
     memcpy(header.riff_id, "RIFF", 4);
     header.file_size = 0;               // 稍后回填
     memcpy(header.wave_id, "WAVE", 4);
     memcpy(header.fmt_id, "fmt ", 4);
     header.fmt_size = 16;
-    header.audio_format = 1;
-    header.num_channels = 1;
-    header.sample_rate = 16000;
-    header.byte_rate = 16000 * 1 * 2;
-    header.block_align = 1 * 2;
-    header.bits_per_sample = 16;
+    header.audio_format = 1;            // PCM 格式
+    header.num_channels = AUDIO_CHANNELS;
+    header.sample_rate = AUDIO_SAMPLE_RATE;
+    header.byte_rate = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * (AUDIO_BIT_DEPTH / 8);
+    header.block_align = AUDIO_CHANNELS * (AUDIO_BIT_DEPTH / 8);
+    header.bits_per_sample = AUDIO_BIT_DEPTH;
     memcpy(header.data_id, "data", 4);
     header.data_size = 0;               // 稍后回填
 
-    f_write(file, &header, sizeof(header), &bytes_written);
+    // 写入WAV头（44字节）
+    size_t written = fwrite(&header, 1, sizeof(header), file);
+    if (written != sizeof(header)) {
+        ESP_LOGE(TAG, "Failed to write WAV header: written=%zu/%zu",
+                 written, sizeof(header));
+    }
 }
 
-void wav_encoder_encode_data(FIL *file, const int16_t *pcm_buf, int sample_count)
+// 写入PCM数据到WAV文件（适配 FILE*）
+void wav_encoder_encode_data(FILE *file, const int16_t *pcm_buf, int sample_count)
 {
-    UINT bytes_written;
-    f_write(file, pcm_buf, sample_count * sizeof(int16_t), &bytes_written);
+    if (!file || !pcm_buf || sample_count <= 0) {
+        ESP_LOGE(TAG, "Invalid params for WAV data encode");
+        return;
+    }
+
+    size_t bytes_to_write = sample_count * sizeof(int16_t);
+    size_t bytes_written = fwrite(pcm_buf, 1, bytes_to_write, file);
+
+    if (bytes_written != bytes_to_write) {
+        ESP_LOGE(TAG, "Failed to write WAV data: written=%zu/%zu",
+                 bytes_written, bytes_to_write);
+    }
 }
 
-void wav_encoder_fix_header(FIL *file, int sample_count)
+// 回填WAV头大小（适配 FILE* 的 fseek/fwrite）
+void wav_encoder_fix_header(FILE *file, int sample_count)
 {
-    UINT bytes_written;
+    if (!file || sample_count <= 0) {
+        ESP_LOGE(TAG, "Invalid params for WAV header fix");
+        return;
+    }
+
     uint32_t data_size = sample_count * sizeof(int16_t);
-    uint32_t file_size = data_size + 36;   // 整个文件大小减去 8（RIFF 头已占用 4+4）
-    // 注意：RIFF 块中的文件大小 = 总文件长度 - 8
+    uint32_t file_size = data_size + 36;  // 总大小-8（RIFF头）
 
-    // 回填 data_size 到偏移 40
-    f_lseek(file, 40);
-    f_write(file, &data_size, 4, &bytes_written);
-    // 回填 file_size 到偏移 4
-    f_lseek(file, 4);
-    f_write(file, &file_size, 4, &bytes_written);
+    // 1. 回填data_size（偏移40）
+    fseek(file, 40, SEEK_SET);  // 标准IO偏移接口
+    size_t written = fwrite(&data_size, 1, 4, file);
+    if (written != 4) {
+        ESP_LOGE(TAG, "Failed to fix WAV data size: written=%zu", written);
+    }
+
+    // 2. 回填file_size（偏移4）
+    fseek(file, 4, SEEK_SET);
+    written = fwrite(&file_size, 1, 4, file);
+    if (written != 4) {
+        ESP_LOGE(TAG, "Failed to fix WAV file size: written=%zu", written);
+    }
+
+    // 恢复文件指针到末尾（可选）
+    fseek(file, 0, SEEK_END);
 }

@@ -1,12 +1,14 @@
 idf_component_register(
-    SRCS
-        "voice_recognition.c"
-        "wav_encoder.c"
+    SRCS  
+       "http_uploader.c"
     INCLUDE_DIRS "."
     REQUIRES
         driver
-        joltwallet__littlefs
+        littlefs
         esp_timer
+        esp_http_client
+        vfs
         storage
         config
+        mbedtls
 )
