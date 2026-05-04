@@ -7,6 +7,7 @@
 #include "voice_recognition.h"
 #include "littlefs_manager.h"
 #include "http_uploader.h"
+#include "transcription.h"
 #include "app_config.h"
 
 static const char *TAG = "APP";
@@ -21,6 +22,13 @@ void main_task(void *pvParameters)
     // 1. 初始化LittleFS
     if (littlefs_init() != ESP_OK) {
         ESP_LOGE(TAG, "LittleFS init failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // 1.1 初始化转文字结果模块
+    if (transcription_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Transcription init failed");
         vTaskDelete(NULL);
         return;
     }

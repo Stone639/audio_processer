@@ -48,10 +48,15 @@ audio_processer/
 │   │   ├── littlefs_manager.h  # LittleFS 操作接口
 │   │   └── littlefs_manager.c
 │   │
-│   └── http/                   # 网络上传
+│   ├── http/                   # 网络上传
+│   │   ├── CMakeLists.txt
+│   │   ├── http_uploader.h     # HTTP 上传接口
+│   │   └── http_uploader.c
+│   │
+│   └── transcription/          # 转文字结果管理
 │       ├── CMakeLists.txt
-│       ├── http_uploader.h     # HTTP 上传接口
-│       └── http_uploader.c
+│       ├── transcription.h     # 对外接口：init/get_latest/get_all/get_count/deinit
+│       └── transcription.c
 │
 ├── .devcontainer/              # Dev Container 配置
 ├── .vscode/                    # VS Code 配置
@@ -95,7 +100,11 @@ LittleFS 文件管理。init 时扫描已有文件恢复序号，避免断电后
 
 ### http — 网络上传
 
-HTTPS POST 上传 WAV 到 SiliconFlow API，multipart/form-data 格式，带 Authorization header。使用 ESP-IDF 证书包验证 HTTPS。上传成功后删除本地文件。
+HTTPS POST 上传 WAV 到 SiliconFlow API，multipart/form-data 格式，带 Authorization header。使用 ESP-IDF 证书包验证 HTTPS。上传成功后删除本地文件，并将转文字结果存入 transcription 模块。
+
+### transcription — 转文字结果管理
+
+环形缓冲区存储最近的转文字结果，供其他模块通过 C 函数调用获取。内部完成 cJSON 解析、mutex 保护，对外只暴露 init/get_latest/get_all/get_count/deinit 五个函数。
 
 ## 组件依赖
 
@@ -104,13 +113,15 @@ main ──→ config
   ├──→ wifi ──→ config
   ├──→ audio ──→ storage
   ├──→ storage
-  └──→ http ──→ storage, config, mbedtls
+  ├──→ transcription ──→ json, config
+  └──→ http ──→ storage, config, mbedtls, transcription
 ```
 
 - `config` 无依赖，被所有组件引用
 - `wifi` 依赖 `config`（读取 SSID/密码）
 - `audio` 依赖 `storage`（录音保存到 LittleFS）
-- `http` 依赖 `storage`（读取待上传文件）+ `config`（读取 API 配置）+ `mbedtls`（HTTPS 证书包）
+- `transcription` 依赖 `json`（cJSON 解析）+ `config`
+- `http` 依赖 `storage`（读取待上传文件）+ `config`（读取 API 配置）+ `mbedtls`（HTTPS 证书包）+ `transcription`（上传成功后存入转文字结果）
 - `main` 依赖所有组件，只做编排，不含业务逻辑
 
 ## 组件规则
@@ -183,6 +194,11 @@ main ──→ config
 5. **响应读取**：打印 API 返回的转文字结果
 6. **WiFi 等待**：main_task 启动后等待最多 10 秒让 WiFi 连上再尝试上传
 
-## 待办
+### 阶段四：转文字结果模块（已完成）
 
-- [ ] 创建 API 接口组件：将 SiliconFlow 返回的转文字结果通过 HTTP server 暴露为 REST API，供其他客户端调用
+1. **transcription 组件**：新建 `components/transcription/`，封装转文字结果的环形缓冲区（20 条，每条 256 字节）
+2. **完全封装**：.h 只暴露 5 个函数（init/get_latest/get_all/get_count/deinit），内部结构体、mutex、cJSON 解析全部在 .c 中
+3. **http_uploader 集成**：上传成功后自动解析 SiliconFlow JSON 响应，提取 `text` 字段存入缓冲区
+4. **线程安全**：FreeRTOS mutex 保护并发访问
+
+## 待办

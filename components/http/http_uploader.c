@@ -1,5 +1,6 @@
 #include "http_uploader.h"
 #include "littlefs_manager.h"
+#include "transcription.h"
 #include "app_config.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -110,7 +111,7 @@ esp_err_t http_upload_file(const char *filepath)
     int status_code = esp_http_client_get_status_code(client);
 
     // 读取响应体（转文字结果）
-    char response_buf[512] = {0};
+    char response_buf[1024] = {0};
     int content_length = esp_http_client_get_content_length(client);
     if (content_length > 0 && content_length < (int)sizeof(response_buf) - 1) {
         int read_len = esp_http_client_read(client, response_buf, content_length);
@@ -125,6 +126,10 @@ esp_err_t http_upload_file(const char *filepath)
 
     if (status_code == 200 || status_code == 201) {
         ESP_LOGI(TAG, "Upload success: %s", filepath);
+        // 解析 JSON 响应，将转文字结果存入缓冲区
+        if (response_buf[0] != '\0') {
+            transcription_parse_and_add(response_buf, filepath);
+        }
         return ESP_OK;
     } else {
         ESP_LOGE(TAG, "Upload failed, status code: %d", status_code);

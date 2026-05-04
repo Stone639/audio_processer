@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS  
+    SRCS
        "http_uploader.c"
     INCLUDE_DIRS "."
     REQUIRES
@@ -11,4 +11,5 @@ idf_component_register(
         storage
         config
         mbedtls
+        transcription
 )
