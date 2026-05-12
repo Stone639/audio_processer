@@ -23,8 +23,17 @@ extern "C" {
 #define AUDIO_BIT_DEPTH     16
 #define AUDIO_CHANNELS      1
 
+// 上传
+#define UPLOAD_INTERVAL_MS  5000
+
 // 存储
 #define MAX_RECORDING_FILES 20
+
+// 环形缓冲区（秒）
+#define RING_BUFFER_SECONDS 3
+
+// 音频积累上传（秒）：积累这么多秒的音频后一次性上传
+#define UPLOAD_ACCUMULATE_SECONDS 5
 
 // I2S 引脚
 #define I2S_PIN_BCK     47

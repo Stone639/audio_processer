@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 
 #include "wifi_manager.h"
@@ -12,77 +13,95 @@
 
 static const char *TAG = "APP";
 
-// --------------------------
-// 主任务：分段录音 + 触发上传
-// --------------------------
+// 内存直传队列：vr_save_task → upload_task
+static QueueHandle_t s_upload_queue = NULL;
+
+// 独立上传任务：先处理内存队列，再合并上传 LittleFS 遗留文件
+void upload_task(void *pvParameters)
+{
+    QueueHandle_t queue = (QueueHandle_t)pvParameters;
+
+    // 等待 WiFi 连接
+    while (!wifi_manager_is_connected()) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    ESP_LOGI(TAG, "Upload task: WiFi connected");
+
+    while (1) {
+        // 1. 优先处理内存直传队列
+        audio_upload_item_t item;
+        while (xQueueReceive(queue, &item, 0) == pdPASS) {
+            char name[32];
+            static uint32_t upload_seq = 0;
+            snprintf(name, sizeof(name), "live_%04lu.wav", upload_seq++);
+            if (http_upload_buffer(item.wav_buf, item.wav_size, name) == ESP_OK) {
+                ESP_LOGI(TAG, "Memory upload success: %s", name);
+            } else {
+                ESP_LOGW(TAG, "Memory upload failed: %s", name);
+            }
+            free(item.wav_buf);
+        }
+
+        // 2. 处理 LittleFS 中的遗留文件（合并上传）
+        http_upload_merged_pending();
+
+        vTaskDelay(pdMS_TO_TICKS(UPLOAD_INTERVAL_MS));
+    }
+}
+
 void main_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Main task started");
 
-    // 1. 初始化LittleFS
+    // 1. 初始化 LittleFS
     if (littlefs_init() != ESP_OK) {
         ESP_LOGE(TAG, "LittleFS init failed");
         vTaskDelete(NULL);
         return;
     }
 
-    // 1.1 初始化转文字结果模块
+    // 2. 初始化转文字结果模块
     if (transcription_init() != ESP_OK) {
         ESP_LOGE(TAG, "Transcription init failed");
         vTaskDelete(NULL);
         return;
     }
 
-    // 2. 初始化录音模块
+    // 3. 初始化 WiFi
+    wifi_manager_init();
+
+    // 4. 创建上传队列
+    s_upload_queue = xQueueCreate(8, sizeof(audio_upload_item_t));
+    if (!s_upload_queue) {
+        ESP_LOGE(TAG, "Failed to create upload queue");
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "Upload queue created (depth=8)");
+
+    // 5. 初始化录音模块（环形缓冲区 + I2S）
     if (vr_init() != VR_SUCCESS) {
         ESP_LOGE(TAG, "VR init failed");
         vTaskDelete(NULL);
         return;
     }
-    xTaskCreate(vr_recording_task, "vr_rec", 4096, NULL, 5, NULL);
 
-    // 3. 等待WiFi连接（最多等10秒）
-    ESP_LOGI(TAG, "Waiting for WiFi...");
-    for (int i = 0; i < 20; i++) {
-        if (wifi_manager_is_connected()) break;
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    if (wifi_manager_is_connected()) {
-        ESP_LOGI(TAG, "WiFi connected");
-    } else {
-        ESP_LOGW(TAG, "WiFi not ready, will retry in main loop");
-    }
+    // 6. 启动连续录音任务（永不停止，优先级最高）
+    xTaskCreate(vr_recording_task, "vr_rec", 8192, NULL, 6, NULL);
 
-    // 4. 先尝试上传上次断电前遗留的文件
-    http_upload_all_pending();
+    // 7. 启动定期保存任务（增量提取 → 积累 → 内存直传或文件回退）
+    xTaskCreate(vr_save_task, "vr_save", 8192, (void *)s_upload_queue, 5, NULL);
 
-    // 4. 主循环：每3秒录一段，存本地，然后尝试上传
+    // 8. 启动独立上传任务（先队列后文件，后台不阻塞保存）
+    xTaskCreate(upload_task, "upload", 12288, (void *)s_upload_queue, 4, NULL);
+
+    // 主任务空闲
     while (1) {
-        ESP_LOGI(TAG, "Starting new recording segment...");
-        
-        // 录一段
-        vr_start_recording();
-        vTaskDelay(pdMS_TO_TICKS(RECORD_DURATION_MS));
-        
-        // 停止并保存到LittleFS
-        vr_stop_and_save_to_littlefs();
-
-        // 尝试上传（如果有网就传，没网就留在本地下次）
-        if (wifi_manager_is_connected()) {
-            http_upload_all_pending();
-        } else {
-            ESP_LOGW(TAG, "WiFi not connected, skip upload");
-        }
-        ESP_LOGI(TAG, "Segment done, waiting for next cycle...\n");
-        vTaskDelay(pdMS_TO_TICKS(RECORD_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 void app_main(void)
 {
-    // 初始化WiFi
-    wifi_manager_init();
-
-    // 启动主任务
     xTaskCreate(main_task, "main_task", 8192, NULL, 5, NULL);
 }

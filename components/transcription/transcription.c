@@ -24,6 +24,10 @@ static int s_head  = 0;   // 下一个写入位置
 static int s_count = 0;   // 当前缓存条数
 static SemaphoreHandle_t s_mutex = NULL;
 
+// 回调
+static transcription_callback_t s_callback = NULL;
+static void *s_callback_user_data = NULL;
+
 /* ---------- 内部工具函数 ---------- */
 
 static int64_t get_timestamp_ms(void)
@@ -70,9 +74,17 @@ esp_err_t transcription_init(void)
     s_head  = 0;
     s_count = 0;
     memset(s_entries, 0, sizeof(s_entries));
+    s_callback = NULL;
+    s_callback_user_data = NULL;
     ESP_LOGI(TAG, "Initialized (max=%d, text_len=%d)",
              TRANSCRIPTION_MAX_ENTRIES, TRANSCRIPTION_TEXT_MAX_LEN);
     return ESP_OK;
+}
+
+void transcription_on_result(transcription_callback_t cb, void *user_data)
+{
+    s_callback = cb;
+    s_callback_user_data = user_data;
 }
 
 int transcription_get_latest(char *buf, size_t buf_size)
@@ -154,6 +166,8 @@ esp_err_t transcription_deinit(void)
     }
     s_head  = 0;
     s_count = 0;
+    s_callback = NULL;
+    s_callback_user_data = NULL;
     ESP_LOGI(TAG, "Deinitialized");
     return ESP_OK;
 }
@@ -186,11 +200,23 @@ esp_err_t transcription_parse_and_add(const char *json_response, const char *fil
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     ring_push(text, filename);
+    int64_t ts = s_entries[(s_head - 1 + TRANSCRIPTION_MAX_ENTRIES) % TRANSCRIPTION_MAX_ENTRIES].timestamp;
     xSemaphoreGive(s_mutex);
+
+    // 取出文件名（不含路径）
+    const char *name = filename ? strrchr(filename, '/') : NULL;
+    name = name ? name + 1 : filename;
 
     ESP_LOGI(TAG, "Stored [%d]: %.64s%s",
              s_count, text,
              strlen(text) > 64 ? "..." : "");
+
+    // 通知回调（锁外调用，避免回调中死锁；text 指向 cJSON 内部，需在 Delete 前调用）
+    transcription_callback_t cb = s_callback;
+    void *ud = s_callback_user_data;
+    if (cb) {
+        cb(text, ts, name, ud);
+    }
 
     cJSON_Delete(root);
     return ESP_OK;

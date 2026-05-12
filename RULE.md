@@ -2,13 +2,14 @@
 
 ## 项目概述
 
-ESP32-S3 音频录制与语音转文字系统。通过 I2S 麦克风采集音频，存为 WAV 到 LittleFS，联网时自动上传到 SiliconFlow API 进行语音识别。
+ESP32-S3 音频录制与语音转文字系统。通过 I2S 麦克风持续采集音频，积累后自动上传到 SiliconFlow API 进行语音识别，支持回调和轮询两种方式获取转录文字。
 
 - 芯片：ESP32-S3
 - IDF 版本：5.5.4
 - 麦克风：INMP441（I2S，24bit/32bit 帧，16kHz 采样率）
-- 本地存储：LittleFS（分区名 `storage`，约 14MB）
+- 本地存储：LittleFS（分区名 `storage`，约 14MB，用于回退存储）
 - 语音识别：SiliconFlow API（FunAudioLLM/SenseVoiceSmall 模型）
+- 主要数据路径：环形缓冲区 → 内存 WAV 构建 → FreeRTOS 队列 → 直接上传（跳过 LittleFS）
 
 ## 目录结构
 
@@ -19,6 +20,7 @@ audio_processer/
 ├── sdkconfig                   # IDF 配置（自动生成，不提交）
 ├── dependencies.lock           # 组件锁文件
 ├── RULE.md                     # 本文件
+├── README.md                   # 使用文档（硬件接线、配置、接口说明）
 │
 ├── main/                       # 应用入口
 │   ├── CMakeLists.txt
@@ -75,10 +77,12 @@ audio_processer/
 - `UPLOAD_SERVER_URL` — SiliconFlow API 地址
 - `UPLOAD_API_KEY` — API Bearer token
 - `UPLOAD_MODEL` — 语音识别模型名
-- `RECORD_DURATION_MS` — 每段录音时长（当前 3000ms）
-- `RECORD_INTERVAL_MS` — 录音间隔（当前 1000ms）
+- `RECORD_INTERVAL_MS` — 保存间隔（当前 1000ms）
+- `UPLOAD_INTERVAL_MS` — 上传检查间隔（当前 5000ms）
 - `AUDIO_SAMPLE_RATE` / `AUDIO_BIT_DEPTH` / `AUDIO_CHANNELS` — 音频参数
 - `MAX_RECORDING_FILES` — 最大缓存文件数（当前 20）
+- `RING_BUFFER_SECONDS` — 环形缓冲区秒数（当前 3）
+- `UPLOAD_ACCUMULATE_SECONDS` — 积累多少秒后上传（当前 5）
 - I2S 引脚定义（BCK/WS/DIN）
 
 ### wifi — WiFi 管理
@@ -92,7 +96,17 @@ audio_processer/
 
 ### audio — 音频采集
 
-I2S 麦克风驱动 + WAV 编码。INMP441 输出 24bit/32bit 帧，I2S 以 32 位读取后取高 16 位存入 buffer。
+I2S 麦克风驱动 + 环形缓冲区 + WAV 编码。连续录音架构：
+
+- `vr_recording_task`（优先级 6）：I2S 立体声读取 → 自动检测有效声道 → 单声道写入环形缓冲区（PSRAM，3 秒窗口）
+- `vr_save_task`（优先级 5）：增量提取新样本 → 积累 5 秒 → 在 PSRAM 中构建 WAV → 通过队列直传 upload_task（队列满时回退到 LittleFS 文件）
+- 上传由 main 中独立的 `upload_task` 负责，不阻塞录音和保存
+
+接口设计：
+- `vr_init()` — 分配环形缓冲区 + 积累缓冲区（PSRAM）、初始化 I2S
+- `vr_recording_task()` — 连续录音任务
+- `vr_save_task()` — 定期保存任务（接收 FreeRTOS 队列句柄作为 pvParameters）
+- `vr_deinit()` — 释放资源
 
 ### storage — 本地存储
 
@@ -100,18 +114,27 @@ LittleFS 文件管理。init 时扫描已有文件恢复序号，避免断电后
 
 ### http — 网络上传
 
-HTTPS POST 上传 WAV 到 SiliconFlow API，multipart/form-data 格式，带 Authorization header。使用 ESP-IDF 证书包验证 HTTPS。上传成功后删除本地文件，并将转文字结果存入 transcription 模块。
+三种上传方式：
+- `http_upload_buffer()` — 从 PSRAM 内存 buffer 直接上传（主路径，队列直传）
+- `http_upload_merged_pending()` — 合并 LittleFS 中所有待传文件为单次上传（回退路径）
+- `http_upload_file()` — 上传单个文件（保留接口）
+
+通用流程：multipart/form-data POST 到 SiliconFlow API，ESP-IDF 证书包验证 HTTPS，上传成功后删除源文件，解析转文字结果存入 transcription 模块。
 
 ### transcription — 转文字结果管理
 
-环形缓冲区存储最近的转文字结果，供其他模块通过 C 函数调用获取。内部完成 cJSON 解析、mutex 保护，对外只暴露 init/get_latest/get_all/get_count/deinit 五个函数。
+环形缓冲区存储最近 20 条转文字结果（每条 256 字节）。两种获取方式：
+- **回调通知**：`transcription_on_result(cb, user_data)` 注册回调，新文字到达时自动触发
+- **主动查询**：`transcription_get_latest()` / `transcription_get_all()` / `transcription_get_count()`
+
+内部完成 cJSON 解析、mutex 保护。
 
 ## 组件依赖
 
 ```
 main ──→ config
   ├──→ wifi ──→ config
-  ├──→ audio ──→ storage
+  ├──→ audio ──→ storage, config
   ├──→ storage
   ├──→ transcription ──→ json, config
   └──→ http ──→ storage, config, mbedtls, transcription
@@ -119,10 +142,10 @@ main ──→ config
 
 - `config` 无依赖，被所有组件引用
 - `wifi` 依赖 `config`（读取 SSID/密码）
-- `audio` 依赖 `storage`（录音保存到 LittleFS）
+- `audio` 依赖 `storage`（LittleFS 回退路径）+ `config`（音频参数）。不依赖 wifi/http，上传由 main 负责。通过 FreeRTOS 队列与 upload_task 通信
 - `transcription` 依赖 `json`（cJSON 解析）+ `config`
 - `http` 依赖 `storage`（读取待上传文件）+ `config`（读取 API 配置）+ `mbedtls`（HTTPS 证书包）+ `transcription`（上传成功后存入转文字结果）
-- `main` 依赖所有组件，只做编排，不含业务逻辑
+- `main` 依赖所有组件，编排三个独立任务：录音（优先级 6）、保存（优先级 5）、上传（优先级 4）
 
 ## 组件规则
 
@@ -201,4 +224,56 @@ main ──→ config
 3. **http_uploader 集成**：上传成功后自动解析 SiliconFlow JSON 响应，提取 `text` 字段存入缓冲区
 4. **线程安全**：FreeRTOS mutex 保护并发访问
 
+### 阶段五：音频驱动深度修复（已完成）
+
+1. **API 返回空文本**：根因是 I2S 单声道模式只读左声道，INMP441 L/R 引脚接高电平时数据在右声道，读到全零
+2. **立体声读取**：改为 `I2S_SLOT_MODE_STEREO` + `I2S_STD_SLOT_BOTH`，运行时比较左右声道能量自动选择有效声道
+3. **I2S 读取不稳定**：DMA 缓冲区从 64 帧增到 256 帧，读取超时从 10ms 增到 100ms，录音前预热 DMA（丢弃初始 3 次读取）
+4. **直流偏置去除**：INMP441 输出有严重 DC offset（~16328），录音后计算均值减去，信号从 `max=32767, min=0` 变为对称
+
+### 阶段六：连续录音架构改造（已完成）
+
+1. **原架构问题**：分段录音 3 秒 → 停止 → 保存 → 上传（串行），上传耗时 20+ 秒期间不录音，语音丢失
+2. **环形缓冲区**：320KB PSRAM 分配，10 秒 16kHz 16bit 单声道窗口，录音任务持续写入永不停止
+3. **三个独立任务**：
+   - `vr_recording_task`（优先级 6）：I2S → 环形缓冲区
+   - `vr_save_task`（优先级 5）：每 ~14 秒提取 10 秒音频，去 DC offset，保存 WAV
+   - `upload_task`（优先级 4）：每 5 秒检查待上传文件，后台 HTTP 上传
+4. **保存与上传解耦**：上传不再阻塞录音和保存，三个任务完全独立
+5. **sdkconfig.defaults**：新增 PSRAM 启用、16MB Flash、自定义分区表配置
+
+### 阶段七：实时性优化（已完成）
+
+1. **增量保存**：消除 90% 音频重叠，文件从 ~320KB 降到 ~32KB
+2. **内存直传**：WAV 在 PSRAM 中构建（`wav_encoder_build_buffer`），通过 FreeRTOS 队列（depth=8）直传 upload_task，跳过 LittleFS 读写
+3. **合并上传**：LittleFS 遗留文件合并为单次 HTTPS POST（`http_upload_merged_pending`），减少 TLS 握手
+4. **队列缓冲**：upload_queue depth=8，40 秒缓冲覆盖上传延迟
+5. **转文字回调**：新增 `transcription_on_result()` 回调接口，新文字到达自动通知
+6. **HTTP 缓冲区**：写缓冲从 1KB 增到 4KB，减少系统调用次数
+7. **FD 泄漏修复**：修复 `littlefs_cleanup_old_files` 与 HTTP 上传的竞态条件，cleanup 移到上传完成后执行
+
+### IRAM 溢出问题（待解决）
+
+**现象**：构建报告 IRAM 使用 100%（15356/16384 字节，剩余 0）。
+
+**根因**：项目代码无 `IRAM_ATTR`，是 ESP-IDF 组件（FreeRTOS、WiFi 驱动、中断处理等）默认将 `.text` 放入 IRAM 导致。
+
+**风险**：IRAM 满载后新增代码或 IDF 组件升级可能导致链接失败或运行时崩溃。
+
+**解决方向**（需在 sdkconfig.defaults 中配置）：
+- `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` — 将 FreeRTOS 非关键函数移到 Flash
+- `CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y` — 从 PSRAM 加载指令（需 PSRAM 支持）
+- `CONFIG_SPIRAM_RODATA=y` — 将只读数据放 PSRAM
+- 增大指令/数据 Cache 减少 IRAM 压力
+
+**待办**：逐项尝试上述配置，验证编译通过且运行稳定。
+
 ## 待办
+
+- [x] 重新构建：需先删 sdkconfig，让 sdkconfig.defaults 生效（PSRAM + 16MB Flash + 自定义分区表）
+- [x] 构建验证：确认 PSRAM 分配成功、环形缓冲区正常工作
+- [x] 运行验证：确认转录文字正常返回
+- [ ] **IRAM 溢出修复**：IRAM 使用 100%，需在 sdkconfig.defaults 中配置 `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` 等选项
+- [ ] 接入摔倒检测逻辑到 main.c 主循环
+- [ ] 麦克风硬件排查：DC offset ~16328 偏大，可能 L/R 引脚浮空或虚焊
+- [ ] README.md 补充：构建烧录步骤、分区表说明、故障排查

@@ -33,6 +33,15 @@ void wav_encoder_fix_header(FILE *file, int sample_count);
 void pcm_raw_file_open(FILE *pcm_file, const char *path);
 void pcm_raw_file_write(FILE *pcm_file, const int16_t *pcm_buf, int sample_count);
 
+/**
+ * @brief 在内存中构建完整 WAV（44 字节头 + PCM 数据），用于免文件上传
+ * @param pcm_buf      int16_t PCM 数据
+ * @param sample_count 采样点数
+ * @param out_size     输出：WAV 总字节数
+ * @return PSRAM 分配的 WAV 缓冲区，调用者负责 free；失败返回 NULL
+ */
+uint8_t* wav_encoder_build_buffer(const int16_t *pcm_buf, int sample_count, size_t *out_size);
+
 #ifdef __cplusplus
 }
 #endif

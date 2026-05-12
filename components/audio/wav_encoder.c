@@ -1,8 +1,10 @@
 #include "wav_encoder.h"
 #include "app_config.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static const char *TAG = "WAV_ENCODER";
 
@@ -131,4 +133,45 @@ void wav_encoder_fix_header(FILE *file, int sample_count)
 
     // 恢复文件指针到末尾（可选）
     fseek(file, 0, SEEK_END);
+}
+
+uint8_t* wav_encoder_build_buffer(const int16_t *pcm_buf, int sample_count, size_t *out_size)
+{
+    if (!pcm_buf || sample_count <= 0 || !out_size) return NULL;
+
+    size_t data_size = sample_count * sizeof(int16_t);
+    size_t total_size = 44 + data_size;
+
+    uint8_t *buf = heap_caps_malloc(total_size, MALLOC_CAP_SPIRAM);
+    if (!buf) return NULL;
+
+    // 直接在 buf 开头写入 header（不依赖结构体，避免对齐问题）
+    memset(buf, 0, 44);
+    memcpy(buf + 0, "RIFF", 4);
+    uint32_t file_size = data_size + 36;
+    memcpy(buf + 4, &file_size, 4);
+    memcpy(buf + 8, "WAVE", 4);
+    memcpy(buf + 12, "fmt ", 4);
+    uint32_t fmt_size = 16;
+    memcpy(buf + 16, &fmt_size, 4);
+    uint16_t audio_format = 1;
+    memcpy(buf + 20, &audio_format, 2);
+    uint16_t num_channels = AUDIO_CHANNELS;
+    memcpy(buf + 22, &num_channels, 2);
+    uint32_t sample_rate = AUDIO_SAMPLE_RATE;
+    memcpy(buf + 24, &sample_rate, 4);
+    uint32_t byte_rate = AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * (AUDIO_BIT_DEPTH / 8);
+    memcpy(buf + 28, &byte_rate, 4);
+    uint16_t block_align = AUDIO_CHANNELS * (AUDIO_BIT_DEPTH / 8);
+    memcpy(buf + 32, &block_align, 2);
+    uint16_t bits_per_sample = AUDIO_BIT_DEPTH;
+    memcpy(buf + 34, &bits_per_sample, 2);
+    memcpy(buf + 36, "data", 4);
+    memcpy(buf + 40, &data_size, 4);
+
+    // PCM 数据
+    memcpy(buf + 44, pcm_buf, data_size);
+
+    *out_size = total_size;
+    return buf;
 }

@@ -2,10 +2,35 @@
 
 #include "esp_err.h"
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/**
+ * @brief 转文字结果回调函数类型
+ *
+ * 新的转录文字到达时被调用。
+ *
+ * @param text      转录的文字内容
+ * @param timestamp 时间戳（毫秒）
+ * @param filename  来源文件名（如 "live_0004.wav" 或 "rec_945.wav"）
+ * @param user_data 注册时传入的用户数据指针
+ */
+typedef void (*transcription_callback_t)(const char *text, int64_t timestamp,
+                                         const char *filename, void *user_data);
+
+/**
+ * @brief 注册转文字结果回调
+ *
+ * 新的转录文字到达时，回调会被调用（在上传任务上下文中执行）。
+ * 回调中不要做耗时操作，如需处理可发消息到其他任务。
+ *
+ * @param cb        回调函数，传 NULL 取消注册
+ * @param user_data 透传给回调的用户数据指针
+ */
+void transcription_on_result(transcription_callback_t cb, void *user_data);
 
 /**
  * @brief 初始化转文字结果模块
