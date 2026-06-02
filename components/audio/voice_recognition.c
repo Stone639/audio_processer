@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -207,21 +208,165 @@ void vr_recording_task(void *pvParameters)
 
 static esp_err_t save_wav_to_littlefs(const int16_t *pcm_data, uint32_t num_samples)
 {
+    // 堆完整性检查：LittleFS 操作前
+    if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true)) {
+        ESP_LOGE(TAG, "Heap corrupted BEFORE LittleFS write!");
+    }
+
+    // 写入前先清理旧文件，确保有空间
+    littlefs_cleanup_old_files();
+
+    // 清理掉电/重启残留的 .tmp 文件（.wav 文件由 upload 任务负责删除）
+    {
+        DIR *dir = opendir(LITTLEFS_BASE_PATH);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                const char *name = entry->d_name;
+                size_t name_len = strlen(name);
+                if (name_len > 4 && strcmp(name + name_len - 4, ".tmp") == 0) {
+                    char stale_path[96];
+                    int n = snprintf(stale_path, sizeof(stale_path), "%s/%s", LITTLEFS_BASE_PATH, name);
+                    if (n > 0 && (size_t)n < sizeof(stale_path)) {
+                        ESP_LOGW(TAG, "Removing stale tmp: %s", stale_path);
+                        remove(stale_path);
+                    }
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    // 拿到最终 .wav 文件名
     char filepath[64];
     littlefs_get_next_filename(filepath, sizeof(filepath));
 
-    FILE *f = fopen(filepath, "wb");
+    // 派生 .tmp 路径，先写临时文件再 rename，避免 upload 任务读到半写文件
+    char tmppath[72];
+    int n = snprintf(tmppath, sizeof(tmppath), "%s.tmp", filepath);
+    if (n < 0 || (size_t)n >= sizeof(tmppath)) {
+        ESP_LOGE(TAG, "Tmp path truncated");
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(tmppath, "wb");
     if (!f) {
-        ESP_LOGE(TAG, "Failed to open file: %s", filepath);
+        ESP_LOGE(TAG, "Failed to open tmp file: %s", tmppath);
         return ESP_FAIL;
     }
 
     wav_encoder_write_header(f);
     wav_encoder_encode_data(f, pcm_data, (int)num_samples);
     wav_encoder_fix_header(f, (int)num_samples);
-    fclose(f);
+
+    // 检查写入和关闭是否有错误
+    bool write_err = ferror(f);
+    int close_ret = fclose(f);
+
+    // 堆完整性检查：LittleFS 操作后
+    if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true)) {
+        ESP_LOGE(TAG, "Heap corrupted AFTER LittleFS write!");
+    }
+
+    if (write_err || close_ret != 0) {
+        ESP_LOGE(TAG, "Write/close error on %s (ferror=%d, fclose=%d)", tmppath, write_err, close_ret);
+        remove(tmppath);
+        return ESP_FAIL;
+    }
+
+    // 原子重命名：upload 扫描只匹配 .wav，不会看到 .tmp
+    if (rename(tmppath, filepath) != 0) {
+        ESP_LOGE(TAG, "Failed to rename %s -> %s", tmppath, filepath);
+        remove(tmppath);
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "Saved to file: %s (%lu samples)", filepath, num_samples);
+    return ESP_OK;
+}
+
+// --- 写 LittleFS 文件（预构建 WAV buffer，上传失败回退路径）---
+
+esp_err_t save_wav_buffer_to_littlefs(const uint8_t *wav_buf, size_t wav_size,
+                                       const char *log_name)
+{
+    if (!wav_buf || wav_size == 0) {
+        ESP_LOGE(TAG, "Invalid WAV buffer for LittleFS save");
+        return ESP_FAIL;
+    }
+
+    if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true)) {
+        ESP_LOGE(TAG, "Heap corrupted BEFORE save_wav_buffer_to_littlefs!");
+    }
+
+    // 写入前先清理旧文件，确保有空间
+    littlefs_cleanup_old_files();
+
+    // 清理掉电/重启残留的 .tmp 文件
+    {
+        DIR *dir = opendir(LITTLEFS_BASE_PATH);
+        if (dir) {
+            struct dirent *entry;
+            while ((entry = readdir(dir)) != NULL) {
+                const char *name = entry->d_name;
+                size_t name_len = strlen(name);
+                if (name_len > 4 && strcmp(name + name_len - 4, ".tmp") == 0) {
+                    char stale_path[96];
+                    int n = snprintf(stale_path, sizeof(stale_path), "%s/%s",
+                                     LITTLEFS_BASE_PATH, name);
+                    if (n > 0 && (size_t)n < sizeof(stale_path)) {
+                        ESP_LOGW(TAG, "Removing stale tmp: %s", stale_path);
+                        remove(stale_path);
+                    }
+                }
+            }
+            closedir(dir);
+        }
+    }
+
+    // 拿到最终 .wav 文件名
+    char filepath[64];
+    littlefs_get_next_filename(filepath, sizeof(filepath));
+
+    // 派生 .tmp 路径
+    char tmppath[72];
+    int n = snprintf(tmppath, sizeof(tmppath), "%s.tmp", filepath);
+    if (n < 0 || (size_t)n >= sizeof(tmppath)) {
+        ESP_LOGE(TAG, "Tmp path truncated");
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(tmppath, "wb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open tmp file: %s", tmppath);
+        return ESP_FAIL;
+    }
+
+    // 直接写入完整的 WAV buffer（已包含 44 字节头 + PCM 数据）
+    size_t written = fwrite(wav_buf, 1, wav_size, f);
+    bool write_err = ferror(f);
+    int close_ret = fclose(f);
+
+    if (!heap_caps_check_integrity(MALLOC_CAP_DEFAULT, true)) {
+        ESP_LOGE(TAG, "Heap corrupted AFTER save_wav_buffer_to_littlefs!");
+    }
+
+    if (written != wav_size || write_err || close_ret != 0) {
+        ESP_LOGE(TAG, "Write/close error on %s (written=%zu/%zu, ferror=%d, fclose=%d)",
+                 tmppath, written, wav_size, write_err, close_ret);
+        remove(tmppath);
+        return ESP_FAIL;
+    }
+
+    // 原子重命名
+    if (rename(tmppath, filepath) != 0) {
+        ESP_LOGE(TAG, "Failed to rename %s -> %s", tmppath, filepath);
+        remove(tmppath);
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Saved upload-failure buffer to file: %s (%zu bytes, from %s)",
+             filepath, wav_size, log_name ? log_name : "unknown");
     return ESP_OK;
 }
 
@@ -240,20 +385,31 @@ void vr_save_task(void *pvParameters)
 
         // 增量提取：只取上次保存后新增的样本
         uint32_t current_write_idx = ring_write_idx;
-        uint32_t new_samples = current_write_idx - last_saved_write_idx;
-        if (new_samples == 0) continue;
+        uint32_t available = current_write_idx - last_saved_write_idx;
+        if (available == 0) continue;
 
-        // clamp（防止极端情况下溢出）
-        if (new_samples > RING_BUFFER_SAMPLES) {
-            new_samples = RING_BUFFER_SAMPLES;
+        // 环形缓冲区过冲保护：采集速度超过消费速度时，跳过已被覆盖的最旧数据
+        if (available > RING_BUFFER_SAMPLES) {
+            ESP_LOGW(TAG, "Ring overrun: available=%lu > capacity=%lu, skipping %lu overwritten samples",
+                     available, (uint32_t)RING_BUFFER_SAMPLES,
+                     available - RING_BUFFER_SAMPLES);
+            available = RING_BUFFER_SAMPLES;
+            last_saved_write_idx = current_write_idx - RING_BUFFER_SAMPLES;
         }
 
-        // 从环形缓冲区提取新样本（反转为时间顺序）
-        for (uint32_t i = 0; i < new_samples; i++) {
-            accum_buffer[accum_samples + i] = ring_get_history(new_samples - 1 - i);
+        // 实际消费量 = 受 accum_buffer 剩余容量限制的可用样本数
+        uint32_t remaining = accum_capacity - accum_samples;
+        uint32_t consume_samples = (available <= remaining) ? available : remaining;
+
+        // 从 last_saved_write_idx 位置开始正向提取（不再从 current 反向计算索引）
+        if (consume_samples > 0) {
+            for (uint32_t i = 0; i < consume_samples; i++) {
+                uint32_t idx = (last_saved_write_idx + i) % RING_BUFFER_SAMPLES;
+                accum_buffer[accum_samples + i] = ring_buffer[idx];
+            }
+            accum_samples += consume_samples;
+            last_saved_write_idx += consume_samples;  // 绝对计数器，仅推进实际消费的样本数
         }
-        accum_samples += new_samples;
-        last_saved_write_idx = current_write_idx;
 
         // 积累未满，继续等待
         if (accum_samples < accum_capacity) continue;

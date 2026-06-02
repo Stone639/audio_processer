@@ -16,7 +16,7 @@ extern "C" {
 
 // 录音参数
 #define RECORD_DURATION_MS  3000
-#define RECORD_INTERVAL_MS  1000
+#define RECORD_INTERVAL_MS  200
 
 // 音频参数
 #define AUDIO_SAMPLE_RATE   16000
@@ -24,7 +24,7 @@ extern "C" {
 #define AUDIO_CHANNELS      1
 
 // 上传
-#define UPLOAD_INTERVAL_MS  5000
+#define UPLOAD_INTERVAL_MS  2000
 
 // 存储
 #define MAX_RECORDING_FILES 20
@@ -33,7 +33,7 @@ extern "C" {
 #define RING_BUFFER_SECONDS 3
 
 // 音频积累上传（秒）：积累这么多秒的音频后一次性上传
-#define UPLOAD_ACCUMULATE_SECONDS 5
+#define UPLOAD_ACCUMULATE_SECONDS 1
 
 // I2S 引脚
 #define I2S_PIN_BCK     47

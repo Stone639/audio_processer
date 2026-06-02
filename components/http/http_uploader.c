@@ -37,14 +37,12 @@ static esp_err_t http_do_upload(esp_http_client_handle_t client,
         return ESP_FAIL;
     }
 
-    // 2. 写入文件内容（4KB 缓冲区分块写入）
+    // 2. 写入文件内容（直接从 PSRAM 分块写入，省去中间缓冲区拷贝）
     size_t offset = 0;
-    uint8_t write_buf[4096];
     while (offset < file_size) {
         size_t chunk = file_size - offset;
-        if (chunk > sizeof(write_buf)) chunk = sizeof(write_buf);
-        memcpy(write_buf, file_data + offset, chunk);
-        wlen = esp_http_client_write(client, (const char *)write_buf, chunk);
+        if (chunk > 4096) chunk = 4096;
+        wlen = esp_http_client_write(client, (const char *)(file_data + offset), chunk);
         if (wlen < (int)chunk) {
             ESP_LOGE(TAG, "Failed to write file content");
             esp_http_client_close(client);
@@ -334,4 +332,99 @@ void http_upload_all_pending(void)
 
     // 上传完成后清理超限文件（此时无文件打开，不会冲突）
     littlefs_cleanup_old_files();
+}
+
+// --- 持久化 HTTP 客户端（keep-alive）实现 ---
+
+esp_http_client_handle_t http_uploader_create_client(void)
+{
+    esp_http_client_config_t config = {
+        .url = UPLOAD_SERVER_URL,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 30000,
+        .keep_alive_enable = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to create HTTP client");
+        return NULL;
+    }
+
+    char content_type[64];
+    snprintf(content_type, sizeof(content_type),
+             "multipart/form-data; boundary=%s", "----ESP32Boundary1234");
+    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_header(client, "Authorization", UPLOAD_API_KEY);
+
+    ESP_LOGI(TAG, "Persistent HTTP client created (keep-alive enabled)");
+    return client;
+}
+
+esp_err_t http_upload_buffer_reuse(esp_http_client_handle_t client,
+                                   const uint8_t *wav_buf, size_t wav_size,
+                                   const char *filename)
+{
+    if (!client) return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGI(TAG, "Uploading buffer (reuse): %s (%zu bytes)", filename, wav_size);
+
+    char body_header[512], body_footer[64];
+    build_multipart_parts(filename, body_header, sizeof(body_header),
+                          body_footer, sizeof(body_footer));
+
+    return http_do_upload(client, body_header, wav_buf, wav_size,
+                          body_footer, filename);
+}
+
+esp_err_t http_upload_file_reuse(esp_http_client_handle_t client,
+                                  const char *filepath)
+{
+    if (!client) return ESP_ERR_INVALID_ARG;
+
+    ESP_LOGI(TAG, "Uploading file (reuse): %s", filepath);
+
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open file for reading: %s", filepath);
+        return ESP_FAIL;
+    }
+
+    struct stat file_stat;
+    stat(filepath, &file_stat);
+    size_t file_size = file_stat.st_size;
+
+    uint8_t *file_buf = heap_caps_malloc(file_size, MALLOC_CAP_SPIRAM);
+    if (!file_buf) {
+        ESP_LOGE(TAG, "Failed to allocate %zu bytes for file upload", file_size);
+        fclose(f);
+        return ESP_FAIL;
+    }
+    size_t bytes_read = fread(file_buf, 1, file_size, f);
+    fclose(f);
+    if (bytes_read != file_size) {
+        ESP_LOGE(TAG, "File read incomplete: %zu/%zu", bytes_read, file_size);
+        free(file_buf);
+        return ESP_FAIL;
+    }
+
+    const char *filename = strrchr(filepath, '/');
+    filename = filename ? filename + 1 : "unknown.wav";
+
+    char body_header[512], body_footer[64];
+    build_multipart_parts(filename, body_header, sizeof(body_header),
+                          body_footer, sizeof(body_footer));
+
+    esp_err_t ret = http_do_upload(client, body_header, file_buf, file_size,
+                                   body_footer, filepath);
+    free(file_buf);
+    return ret;
+}
+
+void http_uploader_cleanup_client(esp_http_client_handle_t client)
+{
+    if (client) {
+        esp_http_client_cleanup(client);
+        ESP_LOGI(TAG, "HTTP client cleaned up");
+    }
 }

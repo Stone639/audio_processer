@@ -78,11 +78,11 @@ audio_processer/
 - `UPLOAD_API_KEY` — API Bearer token
 - `UPLOAD_MODEL` — 语音识别模型名
 - `RECORD_INTERVAL_MS` — 保存间隔（当前 1000ms）
-- `UPLOAD_INTERVAL_MS` — 上传检查间隔（当前 5000ms）
+- `UPLOAD_INTERVAL_MS` — 上传检查间隔（当前 2000ms）
 - `AUDIO_SAMPLE_RATE` / `AUDIO_BIT_DEPTH` / `AUDIO_CHANNELS` — 音频参数
 - `MAX_RECORDING_FILES` — 最大缓存文件数（当前 20）
 - `RING_BUFFER_SECONDS` — 环形缓冲区秒数（当前 3）
-- `UPLOAD_ACCUMULATE_SECONDS` — 积累多少秒后上传（当前 5）
+- `UPLOAD_ACCUMULATE_SECONDS` — 积累多少秒后上传（当前 2）
 - I2S 引脚定义（BCK/WS/DIN）
 
 ### wifi — WiFi 管理
@@ -99,7 +99,7 @@ audio_processer/
 I2S 麦克风驱动 + 环形缓冲区 + WAV 编码。连续录音架构：
 
 - `vr_recording_task`（优先级 6）：I2S 立体声读取 → 自动检测有效声道 → 单声道写入环形缓冲区（PSRAM，3 秒窗口）
-- `vr_save_task`（优先级 5）：增量提取新样本 → 积累 5 秒 → 在 PSRAM 中构建 WAV → 通过队列直传 upload_task（队列满时回退到 LittleFS 文件）
+- `vr_save_task`（优先级 5）：增量提取新样本 → 积累 2 秒 → 在 PSRAM 中构建 WAV → 通过队列直传 upload_task（队列满时回退到 LittleFS 文件）
 - 上传由 main 中独立的 `upload_task` 负责，不阻塞录音和保存
 
 接口设计：
@@ -240,7 +240,7 @@ main ──→ config
    - `vr_save_task`（优先级 5）：每 ~14 秒提取 10 秒音频，去 DC offset，保存 WAV
    - `upload_task`（优先级 4）：每 5 秒检查待上传文件，后台 HTTP 上传
 4. **保存与上传解耦**：上传不再阻塞录音和保存，三个任务完全独立
-5. **sdkconfig.defaults**：新增 PSRAM 启用、16MB Flash、自定义分区表配置
+5. **sdkconfig.defaults**：新增 PSRAM 启用、16MB Flash、自定义分区表配置（后续阶段追加了栈溢出检测、I2S ISR IRAM safe、ISR 栈大小、堆毒化等配置）
 
 ### 阶段七：实时性优化（已完成）
 
@@ -251,6 +251,22 @@ main ──→ config
 5. **转文字回调**：新增 `transcription_on_result()` 回调接口，新文字到达自动通知
 6. **HTTP 缓冲区**：写缓冲从 1KB 增到 4KB，减少系统调用次数
 7. **FD 泄漏修复**：修复 `littlefs_cleanup_old_files` 与 HTTP 上传的竞态条件，cleanup 移到上传完成后执行
+
+### 阶段八：并发安全与稳定性修复（进行中）
+
+1. **实时性参数调整**：`UPLOAD_ACCUMULATE_SECONDS` 从 5 改为 2，`UPLOAD_INTERVAL_MS` 从 5000 改为 2000，端到端延迟从 ~10-15 秒降到 ~4-7 秒
+2. **环形缓冲区竞态修复**：`vr_save_task` 提取循环中 `ring_get_history` 每次调用都读全局 `ring_write_idx`，录音任务可随时抢占推进索引导致读取位置偏移。修复为提取前快照 `current_write_idx`，循环内用快照值计算索引
+3. **LittleFS 递归互斥锁**：`littlefs_manager.c` 原无任何锁保护，`vr_save_task` 和 `upload_task` 可并发操作 LittleFS（opendir/readdir/remove/fopen）。添加 `xSemaphoreCreateRecursiveMutex` 保护所有公开函数，参考 `transcription.c` 的 mutex 模式
+4. **LittleFS 写入错误处理**：`save_wav_to_littlefs` 添加 `ferror` 检查，写入失败时删除损坏文件；写入前调用 `littlefs_cleanup_old_files` 确保有空间
+5. **LittleFS 内存泄漏修复**：`littlefs_get_pending_uploads` 中 `malloc` 失败时清理已分配资源
+6. **任务栈增大**：`vr_recording_task` 和 `vr_save_task` 栈从 8192 增到 12288 字节（`save_wav_to_littlefs` 调用链深：cleanup → opendir/readdir/qsort/fclose）
+7. **GDMA ISR 崩溃排查**：连续出现 `gdma_default_rx_isr` 崩溃，PC 跳到 LittleFS 文件路径字符串地址（`0x000e000f`、`0x00210008`）。根因疑似堆损坏，LittleFS 操作破坏堆元数据后波及 GDMA 驱动内部结构。排查措施：
+   - `sdkconfig.defaults` 添加 `CONFIG_I2S_ISR_IRAM_SAFE=y`（ISR 不访问 PSRAM）
+   - `CONFIG_ESP_INTERRUPT_LOOP_STACK_SIZE=4096`（增大 ISR 栈）
+   - `CONFIG_HEAP_POISONING_LIGHT=y`（堆毒化，损坏时立即断言）
+   - `CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y`（栈溢出检测）
+   - `save_wav_to_littlefs` 和 `upload_task` 中添加 `heap_caps_check_integrity` 堆完整性检查
+   - 需删 `sdkconfig` 重新构建让配置生效
 
 ### IRAM 溢出问题（待解决）
 
@@ -273,6 +289,7 @@ main ──→ config
 - [x] 重新构建：需先删 sdkconfig，让 sdkconfig.defaults 生效（PSRAM + 16MB Flash + 自定义分区表）
 - [x] 构建验证：确认 PSRAM 分配成功、环形缓冲区正常工作
 - [x] 运行验证：确认转录文字正常返回
+- [ ] **GDMA ISR 崩溃修复**：堆完整性检查 + 堆毒化定位根因，需删 sdkconfig 重新构建
 - [ ] **IRAM 溢出修复**：IRAM 使用 100%，需在 sdkconfig.defaults 中配置 `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` 等选项
 - [ ] 接入摔倒检测逻辑到 main.c 主循环
 - [ ] 麦克风硬件排查：DC offset ~16328 偏大，可能 L/R 引脚浮空或虚焊
